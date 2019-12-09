@@ -2,17 +2,8 @@
 raspbian-imager
 ===============
 
-This is a collection of scripts that assist making operating system images for the Raspberry Pi from scratch, based on the Raspbian Linux distribution.
+This is a Python script that creates an SD card image for some types of Raspberry Pi to boot into the mainline Debian installer. The created image will contain three partitions: the Raspberry Pi firmware partition (to be mounted to /boot/firmware), an EFI partition (/boot/efi) and a third partition holding the Debian installer files.
 
-The Scripts
-===========
+The boot process involves U-Boot, booting into Grub, booting into the Linux kernel with the Debian installer.
 
-raspbian-imager
----------------
-
-This is the main script.
-
-setup-repository
-----------------
-
-Sets up a Debian repository that is used as local mirror of Raspbian. The mirror is configured to only contain a minimal set of packages needed for package creation. Using this mirror does not only speed up repeated image creation, it also allows to ingest alternative versions or local builds of packages where needed.
+When installing Debian, just delete the third partition on the card and create a new partition using the rest of the available capacity on the card as the root file system.

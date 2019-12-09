@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+
+import argparse
+import collections
+import os
+import subprocess
+import sys
+import uuid
+
+Model = collections.namedtuple(
+    "Model",
+    ["name", "dtb", "uboot_config", "arch", "start_fixup"],
+    defaults=[None],
+)
+
+models = {
+    m.name: m
+    for m in [
+        Model(
+            "3b",
+            "http://http.debian.net/debian/dists/buster/main/installer-arm64/"
+            "current/images/device-tree/broadcom/bcm2837-rpi-3-b.dtb",
+            "rpi_3_defconfig",
+            "arm64",
+        ),
+        Model("4b", "bcm2711-rpi-4-b.dtb", "rpi_4_defconfig", "arm64", "4"),
+    ]
+}
+
+cross = {"armhf": "arm-linux-gnueabihf-", "arm64": "aarch64-linux-gnu-"}
+
+grub_pkg = {
+    "armhf": (
+        "http://http.debian.net/debian/pool/main/g/grub2/"
+        "grub-efi-arm-bin_2.04-4_armhf.deb"
+    ),
+    "arm64": (
+        "http://http.debian.net/debian/pool/main/g/grub2/"
+        "grub-efi-arm64-bin_2.04-4_arm64.deb"
+    ),
+}
+
+debian_installer = {
+    "arm64": {
+        "_root_url": (
+            "http://http.debian.net/debian/dists/buster/main/installer-arm64/"
+            "current/images/netboot/"
+        ),
+        "kernel": "debian-installer/arm64/linux",
+        "initrd": "debian-installer/arm64/initrd.gz",
+        "grub-config": "debian-installer/arm64/grub/grub.cfg",
+    }
+}
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--firmware-partition-size",
+        type=int,
+        help="size of firmware partition in MB",
+        default=128,
+    )
+    parser.add_argument(
+        "--efi-partition-size",
+        type=int,
+        help="size of EFI partition in MB",
+        default=16,
+    )
+    parser.add_argument("model")
+    parser.add_argument("output")
+    args = parser.parse_args()
+
+    try:
+        model = models[args.model]
+    except Exception:
+        sys.stderr.write(
+            f"Model must be one of: { ', '.join(sorted(models)) }\n"
+        )
+        raise SystemExit(1)
+
+    debian_installer_download = f"download/debian-installer-{ model.arch }"
+    for dirname in "build", "download", debian_installer_download:
+        try:
+            os.mkdir(dirname)
+        except FileExistsError:
+            ...
+
+    tmpdir = f"build/{ uuid.uuid4() }"
+    os.mkdir(tmpdir)
+
+    ##########################################################################
+    # devicetree
+
+    if "://" in model.dtb:
+        dtb = f"download/{ model.dtb.rsplit('/', 1)[1] }"
+        if not os.path.exists(dtb):
+            subprocess.check_call(["wget", model.dtb], cwd="download")
+    else:
+        dtb = f"firmware/boot/{ model.dtb }"
+
+    ##########################################################################
+    # Build u-boot
+    # subprocess.check_call(["git", "clean", "-fdx"], cwd="u-boot")
+    subprocess.check_call(["make", model.uboot_config], cwd="u-boot")
+    subprocess.check_call(
+        ["make", "-j"],
+        cwd="u-boot",
+        env={**os.environ, "CROSS_COMPILE": cross[model.arch]},
+    )
+
+    ##########################################################################
+    # u-boot script
+    uboot_scr = f"{ tmpdir }/boot.scr"
+    uboot_scr_txt = uboot_scr + ".txt"
+    with open(uboot_scr_txt, "w") as f:
+        f.write(
+            "load mmc 0:2 $kernel_addr_r EFI/debian/grubaa64.efi\n"
+            "setenv bootargs prefix=(hd0,msdos2)/EFI/debian\n"
+            "bootefi $kernel_addr_r 0x100\n"
+        )
+
+    subprocess.check_call(
+        [
+            "mkimage",
+            "-A",
+            "arm64",
+            "-O",
+            "linux",
+            "-T",
+            "script",
+            "-C",
+            "none",
+            "-n",
+            "boot.scr",
+            "-d",
+            uboot_scr_txt,
+            uboot_scr,
+        ]
+    )
+
+    ##########################################################################
+    # config.txt
+
+    config_txt = f"{ tmpdir }/config.txt"
+    with open(config_txt, "w") as f:
+        f.write(f"device_tree={ dtb.rsplit('/',1)[-1] }\n")
+        f.write("device_tree_address=0x100\n")
+        f.write("hdmi_group=2\nhdmi_mode=14\n")
+        if model.arch == "arm64":
+            f.write("arm_64bit=1\n")
+        f.write("kernel=u-boot.bin\n")
+
+    ##########################################################################
+    # Make firmware partition
+    part1 = f"{ tmpdir }/part1.vfat"
+    mkfs_vfat(
+        part1, args.firmware_partition_size * 1024 ** 2, label="FIRMWARE"
+    )
+    filenames = [
+        f"firmware/boot/{ fn }"
+        for fn in (
+            "bootcode.bin",
+            "COPYING.linux",
+            f"fixup{ model.start_fixup or '' }.dat",
+            f"fixup{ model.start_fixup or '_' }cd.dat",
+            f"fixup{ model.start_fixup or '_' }db.dat",
+            f"fixup{ model.start_fixup or '_' }x.dat",
+            "LICENCE.broadcom",
+            "overlays",
+            f"start{ model.start_fixup or '' }.elf",
+            f"start{ model.start_fixup or '_' }cd.elf",
+            f"start{ model.start_fixup or '_' }db.elf",
+            f"start{ model.start_fixup or '_' }x.elf",
+        )
+    ] + ["u-boot/u-boot.bin", uboot_scr, config_txt, dtb]
+    subprocess.check_call(["mcopy", "-s", "-b", "-i", part1, *filenames, "::"])
+
+    ##########################################################################
+    # grub.cfg
+    grub_cfg = f"{ tmpdir }/grub.cfg"
+
+    with open(grub_cfg, "w") as f:
+        f.write(
+            "insmod part_msdos\n"
+            "set root=(hd0,msdos3)\n"
+            f"configfile /{ debian_installer[model.arch]['grub-config'] }\n"
+        )
+
+    ##########################################################################
+    # Build GRUB image
+    os.mkdir(f"{ tmpdir }/EFI")
+    os.mkdir(f"{ tmpdir }/EFI/debian")
+    grub_deb_url = grub_pkg[model.arch]
+    grub_deb_fn = "download/" + grub_deb_url.rsplit("/", 1)[1]
+    if not os.path.exists(grub_deb_fn):
+        subprocess.check_call(["wget", grub_deb_url], cwd="download")
+
+    subprocess.check_call(["dpkg", "-x", grub_deb_fn, f"{ tmpdir }/debs"])
+
+    subprocess.check_call(
+        [
+            "grub-mkstandalone",
+            "--directory",
+            f"{ tmpdir }/debs/usr/lib/grub/arm64-efi",
+            "-O",
+            "arm64-efi",
+            "-o",
+            f"{ tmpdir }/EFI/debian/grubaa64.efi",
+            f"/boot/grub/grub.cfg={ grub_cfg }",
+        ]
+    )
+
+    ##########################################################################
+    # Make EFI partition
+    part2 = f"{ tmpdir }/part2.vfat"
+    mkfs_vfat(part2, args.efi_partition_size * 1024 ** 2, label="EFI")
+    subprocess.check_call(
+        ["mcopy", "-s", "-b", "-i", part2, f"{ tmpdir }/EFI", "::"]
+    )
+
+    ##########################################################################
+    # Make debian-installer partition
+    part3 = f"{ tmpdir }/part3.vfat"
+    debinst = debian_installer[model.arch]
+    root_url = debinst["_root_url"]
+    installer_size_mb = 2
+
+    for key, rpath in debinst.items():
+        if key.startswith("_"):
+            continue
+        path = os.path.join(debian_installer_download, rpath)
+        if not os.path.exists(path):
+            url = root_url + rpath
+            dirname, filename = os.path.split(path)
+            try:
+                os.makedirs(dirname)
+            except FileExistsError:
+                ...
+            subprocess.check_call(["wget", url], cwd=dirname)
+        installer_size_mb += 1 + os.stat(path).st_size // 1024 ** 2
+
+    mkfs_vfat(part3, installer_size_mb * 1024 ** 2, label="DEB_INST")
+    subprocess.check_call(
+        [
+            "mcopy",
+            "-s",
+            "-b",
+            "-i",
+            os.path.relpath(part3, debian_installer_download),
+            *os.listdir(debian_installer_download),
+            "::",
+        ],
+        cwd=debian_installer_download,
+    )
+
+    ##########################################################################
+    # Create image
+    imgfile = args.output
+    with open(imgfile, "wb") as f:
+        f.truncate(
+            (
+                1
+                + args.firmware_partition_size
+                + args.efi_partition_size
+                + installer_size_mb
+            )
+            * 1024 ** 2
+        )
+    proc = subprocess.Popen(
+        ["/sbin/sfdisk", imgfile], stdin=subprocess.PIPE, encoding="utf-8"
+    )
+    proc.stdin.write("label: dos\n")
+    proc.stdin.write("unit: sectors\n")
+    start = 1
+    dd_commands = []
+    for part, size, type in [
+        (part1, args.firmware_partition_size, "c,bootable"),
+        (part2, args.efi_partition_size, "ef"),
+        (part3, installer_size_mb, "c"),
+    ]:
+        proc.stdin.write(
+            f"start={ start*2048 }, size={ size*2048 }, type={ type }\n"
+        )
+        dd_commands.append(
+            [
+                "dd",
+                f"if={ part }",
+                f"of={ imgfile }",
+                "bs=1M",
+                "conv=sparse",
+                f"seek={ start }",
+            ]
+        )
+        start += size
+    proc.stdin.close()
+    if 0 != proc.wait():
+        raise Exception("sfdisk returned non-zero exit code")
+
+    for ddc in dd_commands:
+        subprocess.check_call(ddc)
+
+
+def mkfs_vfat(filename, size, *, label=None):
+    with open(filename, "wb") as f:
+        f.truncate(size)
+    args = []
+    if label is not None:
+        args.extend(("-n", label))
+    subprocess.check_call(["/sbin/mkfs.vfat", *args, filename])
+
+
+if __name__ == "__main__":
+    main()
