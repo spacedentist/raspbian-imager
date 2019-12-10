@@ -102,6 +102,14 @@ def main():
     ##########################################################################
     # Build u-boot
     # subprocess.check_call(["git", "clean", "-fdx"], cwd="u-boot")
+    subprocess.check_call(["git", "checkout", "--", "."], cwd="u-boot")
+    with open(f"u-boot/configs/{ model.uboot_config }", "a") as f:
+        f.write(
+            "\n"
+            "CONFIG_USE_BOOTCOMMAND=y\n"
+            "CONFIG_BOOTCOMMAND="
+            '"fatload mmc 0:1 ${scriptaddr} /boot.scr; source ${scriptaddr}"\n'
+        )
     subprocess.check_call(["make", model.uboot_config], cwd="u-boot")
     subprocess.check_call(
         ["make", "-j"],
