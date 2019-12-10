@@ -154,7 +154,7 @@ def main():
     with open(config_txt, "w") as f:
         f.write(f"device_tree={ dtb.rsplit('/',1)[-1] }\n")
         f.write("device_tree_address=0x100\n")
-        f.write("hdmi_group=2\nhdmi_mode=14\n")
+        f.write("hdmi_group=2\nhdmi_mode=14\ndisable_overscan=1\n")
         if model.arch == "arm64":
             f.write("arm_64bit=1\n")
         f.write("kernel=u-boot.bin\n")
