@@ -191,6 +191,7 @@ def main():
     with open(grub_cfg, "w") as f:
         f.write(
             "insmod part_msdos\n"
+            "insmod squash4\n"
             "set root=(hd0,msdos3)\n"
             f"configfile /{ debian_installer[model.arch]['grub-config'] }\n"
         )
@@ -229,10 +230,9 @@ def main():
 
     ##########################################################################
     # Make debian-installer partition
-    part3 = f"{ tmpdir }/part3.vfat"
+    part3 = f"{ tmpdir }/part3.squashfs"
     debinst = debian_installer[model.arch]
     root_url = debinst["_root_url"]
-    installer_size_mb = 2
 
     for key, rpath in debinst.items():
         if key.startswith("_"):
@@ -246,21 +246,12 @@ def main():
             except FileExistsError:
                 ...
             subprocess.check_call(["wget", url], cwd=dirname)
-        installer_size_mb += 1 + os.stat(path).st_size // 1024 ** 2
 
-    mkfs_vfat(part3, installer_size_mb * 1024 ** 2, label="DEB_INST")
     subprocess.check_call(
-        [
-            "mcopy",
-            "-s",
-            "-b",
-            "-i",
-            os.path.relpath(part3, debian_installer_download),
-            *os.listdir(debian_installer_download),
-            "::",
-        ],
-        cwd=debian_installer_download,
+        ["mksquashfs", debian_installer_download, part3, "-all-root"]
     )
+
+    installer_size_mb = os.stat(part3).st_size // 1024 ** 2 + 1
 
     ##########################################################################
     # Create image
@@ -285,7 +276,7 @@ def main():
     for part, size, type in [
         (part1, args.firmware_partition_size, "c,bootable"),
         (part2, args.efi_partition_size, "ef"),
-        (part3, installer_size_mb, "c"),
+        (part3, installer_size_mb, "83"),
     ]:
         proc.stdin.write(
             f"start={ start*2048 }, size={ size*2048 }, type={ type }\n"
