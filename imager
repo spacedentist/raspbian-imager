@@ -112,7 +112,7 @@ def main():
         )
     subprocess.check_call(["make", model.uboot_config], cwd="u-boot")
     subprocess.check_call(
-        ["make", "-j"],
+        ["make", "u-boot.bin", "-j"],
         cwd="u-boot",
         env={**os.environ, "CROSS_COMPILE": cross[model.arch]},
     )
