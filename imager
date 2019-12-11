@@ -3,6 +3,7 @@
 import argparse
 import collections
 import os
+import shutil
 import subprocess
 import sys
 import uuid
@@ -46,9 +47,9 @@ debian_installer = {
             "http://http.debian.net/debian/dists/buster/main/installer-arm64/"
             "current/images/netboot/"
         ),
-        "kernel": "debian-installer/arm64/linux",
-        "initrd": "debian-installer/arm64/initrd.gz",
-        "grub-config": "debian-installer/arm64/grub/grub.cfg",
+        "linux": "debian-installer/arm64/linux",
+        "initrd.gz": "debian-installer/arm64/initrd.gz",
+        "grub.cfg": "debian-installer/arm64/grub/grub.cfg",
     }
 }
 
@@ -193,7 +194,7 @@ def main():
             "insmod part_msdos\n"
             "insmod squash4\n"
             "set root=(hd0,msdos3)\n"
-            f"configfile /{ debian_installer[model.arch]['grub-config'] }\n"
+            f"configfile /{ debian_installer[model.arch]['grub.cfg'] }\n"
         )
 
     ##########################################################################
@@ -229,27 +230,68 @@ def main():
     )
 
     ##########################################################################
+    # Extra files for debian-installer initrd
+    extra_files = f"{ tmpdir }/di-initrd-extra-files"
+    os.mkdir(extra_files)
+
+    with open(f"{ extra_files}/preseed.cfg", "w") as f:
+        f.write("grub-efi-arm64 grub2/update_nvram boolean false\n")
+
+    ##########################################################################
     # Make debian-installer partition
     part3 = f"{ tmpdir }/part3.squashfs"
     debinst = debian_installer[model.arch]
     root_url = debinst["_root_url"]
+    debinst_dir = f"{ tmpdir }/debian-installer-partition"
+    os.mkdir(debinst_dir)
 
     for key, rpath in debinst.items():
         if key.startswith("_"):
             continue
-        path = os.path.join(debian_installer_download, rpath)
-        if not os.path.exists(path):
+        download_path = os.path.join(debian_installer_download, key)
+        if not os.path.exists(download_path):
             url = root_url + rpath
-            dirname, filename = os.path.split(path)
             try:
-                os.makedirs(dirname)
+                os.makedirs(os.path.dirname(download_path))
             except FileExistsError:
                 ...
-            subprocess.check_call(["wget", url], cwd=dirname)
+            subprocess.check_call(["wget", "-O", download_path, url])
+        path = os.path.join(debinst_dir, rpath)
+        try:
+            os.makedirs(os.path.dirname(path))
+        except FileExistsError:
+            ...
+        shutil.copy2(download_path, path)
 
-    subprocess.check_call(
-        ["mksquashfs", debian_installer_download, part3, "-all-root"]
-    )
+        if key == "initrd.gz":
+            with open(path, "ab") as initrd:
+                gzip_proc = subprocess.Popen(
+                    ["gzip", "--no-name", "-9"],
+                    stdout=initrd,
+                    stdin=subprocess.PIPE,
+                )
+                cpio_proc = subprocess.Popen(
+                    ["cpio", "-o", "-H", "newc"],
+                    cwd=extra_files,
+                    stdout=gzip_proc.stdin,
+                    stdin=subprocess.PIPE,
+                )
+                for dirpath, dirnames, filenames in os.walk(extra_files):
+                    prefix = os.path.relpath(dirpath, extra_files)
+                    prefix = "" if prefix == "." else f"{ prefix }/"
+                    for seq in dirnames, filenames:
+                        for item in seq:
+                            cpio_proc.stdin.write(
+                                f"{ prefix }{ item }\n".encode("utf-8")
+                            )
+                cpio_proc.stdin.close()
+                if 0 != cpio_proc.wait():
+                    raise Exception("cpio failed")
+                gzip_proc.stdin.close()
+                if 0 != gzip_proc.wait():
+                    raise Exception("gzip failed")
+
+    subprocess.check_call(["mksquashfs", debinst_dir, part3, "-all-root"])
 
     installer_size_mb = os.stat(part3).st_size // 1024 ** 2 + 1
 
